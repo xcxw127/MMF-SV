@@ -1,0 +1,206 @@
+#!/home/xzy/usr/anaconda3/envs/MMF-SV-py3.11/bin/python
+import os
+import argparse
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning import seed_everything
+
+# Ray Tune 及 hyperopt 相关
+import ray
+from ray import tune
+from ray.tune import CLIReporter
+from ray.tune.search import Repeater
+from ray.tune.schedulers import ASHAScheduler
+from ray.tune.search.hyperopt import HyperOptSearch
+# from ray.tune.integration.pytorch_lightning import TuneReportCallback, TuneReportCheckpointCallback
+# from hyperopt import hp
+
+# 从你的项目里导入网络结构
+# 假设 mmfsv.net 里定义了 IDENet
+from mmfsv.net import IDENet
+
+def main():
+    """
+    仅包含你所需的训练（main_train、train_tune、gan_tune）等部分。
+    你需要事先准备好数据，并确保相关的 .pt 文件和 mmfsv.net(IDENet) 依赖可导入。
+    """
+
+    parser = argparse.ArgumentParser(description="F-SV Training Only (Ray Tune or Normal Training)")
+    parser.add_argument('-D', '--data_dir', type=str, required=True,
+                        help="Path to the data directory (包含预处理完成后的 .pt 文件)")
+    parser.add_argument('-bs', '--batch_size', type=int, default=16,
+                        help="Batch size for training (default: 16)")
+    parser.add_argument('-GPU', '--GPU_index', type=str, default="0",
+                        help="GPU index used for training (default: 0)")
+    parser.add_argument('--use_tune', action='store_true',
+                        help="是否使用 Ray Tune 超参搜索。如果不加这个参数，则只执行普通训练。")
+    args = parser.parse_args()
+
+    # 一些固定配置
+    my_label = "7+11channel_predict_5fold"
+    data_dir = args.data_dir
+    bs = args.batch_size
+    num_cuda = args.GPU_index
+
+    # 固定随机种子
+    seed_everything(2024)
+
+    # 指定 GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = num_cuda
+
+    # 创建日志记录器
+    logger = TensorBoardLogger(
+        save_dir=os.path.join(data_dir, "channel_predict"),
+        name=my_label
+    )
+
+    # 创建检查点回调
+    checkpoint_callback = ModelCheckpoint(
+        dirpath="./checkpoints_predict/" + my_label,
+        filename='{epoch:02d}-{validation_f1:.2f}-{train_mean:.2f}',
+        monitor="validation_f1",
+        verbose=False,
+        save_last=None,
+        save_top_k=1,
+        mode="max",
+        auto_insert_metric_name=True
+    )
+
+    print("\n<=============== F-SV: Training ===============>")
+
+    def main_train():
+        """
+        普通训练，不启用 Ray Tune 的超参搜索
+        """
+        config = {
+            "batch_size": bs,
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "lr": 7.187267009530772e-06,
+            "weight_decay": 0.0011614665567890423,
+            "model_name": "resnet50",
+            "KFold": 5,
+            "KFold_num": 0,
+        }
+        # 构建模型
+        model = IDENet(data_dir, config)
+
+        trainer = pl.Trainer(
+            max_epochs=30,
+            accelerator="gpu",
+            devices=num_gpus,
+            check_val_every_n_epoch=1,
+            logger=logger,
+            callbacks=[checkpoint_callback],
+        )
+        trainer.fit(model)
+
+    def train_tune(config, checkpoint_dir=None, num_epochs=200, num_gpus=1):
+        """
+        用于 Ray Tune 的训练函数
+        """
+        model = IDENet(data_dir, config)
+        # 注意：这里重新定义一个 checkpoint_callback 供 tune 用，
+        # 也可重用外部的那个，但路径会有冲突，所以单独定一个路径也行
+        checkpoint_callback_tune = ModelCheckpoint(
+            dirpath="./checkpoints_predict/" + my_label + "_tune",
+            filename='{epoch:02d}-{validation_f1:.2f}-{validation_mean:.2f}',
+            monitor="validation_f1",
+            verbose=False,
+            save_last=None,
+            save_top_k=1,
+            mode="max",
+            auto_insert_metric_name=True
+        )
+        # trainer = pl.Trainer(
+        #     max_epochs=num_epochs,
+        #     gpus=num_gpus,
+        #     check_val_every_n_epoch=1,
+        #     logger=logger,
+        #     callbacks=[checkpoint_callback_tune],
+        # )
+        trainer = pl.Trainer(
+            max_epochs=num_epochs,
+            accelerator="gpu",
+            devices=num_gpus,
+            check_val_every_n_epoch=1,
+            logger=logger,
+            callbacks=[checkpoint_callback_tune],
+        )
+        trainer.fit(model)
+
+    class MyStopper(tune.Stopper):
+        """
+        Ray Tune 停止策略示例
+        """
+        def __init__(self, metric, value, epoch=1):
+            self._metric = metric
+            self._value = value
+            self._epoch = epoch
+
+        def __call__(self, trial_id, result):
+            return (result["training_iteration"] > self._epoch) and (result[self._metric] < self._value)
+
+        def stop_all(self):
+            return False
+
+    def gan_tune(num_samples=-1, num_epochs=30, gpus_per_trial=1):
+        """
+        Ray Tune 的超参搜索示例
+        """
+        config = {
+            "batch_size": bs,
+            "lr": tune.loguniform(1e-7, 1e-5),
+            "weight_decay": tune.uniform(0, 0.001),
+            "beta1": 0.9,
+            "beta2": 0.999,
+            "model_name": "ViT-B/32",
+            "use_kfold": False,
+        }
+
+        bayesopt = HyperOptSearch(metric="validation_f1", mode="max")
+        re_search_alg = Repeater(bayesopt, repeat=1)
+
+        scheduler = ASHAScheduler(
+            max_t=num_epochs,
+            grace_period=1,
+            reduction_factor=2,
+        )
+
+        reporter = CLIReporter(
+            metric_columns=['train_loss', "train_f1", 'validation_loss', "validation_f1"]
+        )
+
+        analysis = tune.run(
+            tune.with_parameters(
+                train_tune,
+                num_epochs=num_epochs,
+            ),
+            local_dir=os.path.join(data_dir, "ray_logs"),
+            resources_per_trial={"cpu": 1, "gpu": 1},
+            config=config,
+            num_samples=num_samples,
+            metric='validation_f1',
+            mode='max',
+            scheduler=scheduler,
+            progress_reporter=reporter,
+            resume=False,
+            search_alg=re_search_alg,
+            max_failures=-1,
+            name="5fold_" + num_cuda
+        )
+
+    # 根据用户参数决定执行普通训练还是 Ray Tune 超参搜索
+    if args.use_tune:
+        print(">> 使用 Ray Tune 进行超参搜索 ...")
+        ray.init()
+        gan_tune(num_samples=10, num_epochs=30, gpus_per_trial=1)  # 具体参数可再调
+    else:
+        print(">> 直接进行普通训练 ...")
+        main_train()
+
+
+if __name__ == "__main__":
+    main()

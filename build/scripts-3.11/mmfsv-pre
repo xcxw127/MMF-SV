@@ -1,0 +1,375 @@
+#!/home/xzy/usr/anaconda3/envs/MMF-SV-py3.11/bin/python
+import argparse
+import os
+import sys
+import time
+import shutil
+import re
+import pandas as pd
+import subprocess
+import multiprocessing
+
+# If you have a local "utilities.py" with a mymkdir function:
+# from utilities import mymkdir
+# For demonstration here, let's define a simple mymkdir function inline:
+def mymkdir(path):
+    """Mimic the mymkdir utility from your 'utilities.py'."""
+    os.makedirs(path, exist_ok=True)
+
+# ----------------- VCF Preprocess Logic ---------------- #
+def list_save(filename, data):
+    """Write a list of strings to a file."""
+    with open(filename, 'w') as f:
+        f.writelines(data)
+    print(f"{filename} file saved successfully")
+
+def set_save(filename, data):
+    """Write a set of strings (one per line) to a file."""
+    with open(filename, 'w') as f:
+        f.writelines([line + '\n' for line in data])
+    print(f"{filename} file saved successfully")
+
+def check_output_files(data_dir, vcf_name):
+    """Check if all required VCF output files exist."""
+    required_files = [
+        f"{vcf_name}_ins",
+        f"{vcf_name}_del",
+        f"{vcf_name}_chr",
+        "delete_result_data.csv.vcf",
+        "insert_result_data.csv.vcf"
+    ]
+    missing_files = [
+        f for f in required_files
+        if not os.path.exists(os.path.join(data_dir, f))
+    ]
+    return missing_files
+
+def vcf_preprocess(args):
+    """
+    Encapsulates the entire VCF preprocessing logic.
+
+    Args:
+        args.data_dir (str): Directory where processed files go.
+        args.vcf_dir (str): Path to the input VCF file.
+    """
+    data_dir = args.data_dir
+    vcf_dir = args.vcf_dir
+
+    current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print("<=============== F-SV: VCF Preprocess ===============>")
+    print(f"[INFO] F-SV preprocess VCF file begin time: {current_time}\n")
+
+    start_time = time.time()
+
+    # Extract the filename from the VCF path and derive final save path.
+    vcf_name = os.path.basename(vcf_dir)
+    vcf_save_dir = os.path.join(data_dir, vcf_name)
+
+    # Step 1: Check if the VCF file exists in data_dir; if not, copy it
+    print("> Check the VCF file exist...")
+    if not os.path.exists(vcf_save_dir):
+        try:
+            shutil.copy(vcf_dir, vcf_save_dir)
+            print(f"[INFO] Copied VCF file to data directory: {vcf_save_dir}")
+        except Exception as e:
+            print(f"[ERROR] Failed to copy VCF file: {e}")
+            sys.exit(1)
+    else:
+        print(f"[INFO] VCF file already exists in data directory: {vcf_save_dir}")
+
+    # Step 2: Check if all required output files exist
+    print("\n> Check the output files exist...")
+    missing_files = check_output_files(data_dir, vcf_name)
+    if not missing_files:
+        print("[INFO] All output files already exist. Skipping processing.")
+        sys.exit(0)
+    else:
+        print("[INFO] Missing output files detected. Proceeding with processing.")
+        print("[INFO] Missing files:")
+        for mf in missing_files:
+            print(f"       - {mf}")
+
+    # Step 3: Parse the VCF and produce INS and DEL outputs
+    filename = vcf_save_dir
+    insert = ["CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tHG002\n"]
+    delete = ["CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tHG002\n"]
+    chr_list = set()
+
+    with open(filename, "r") as f:
+        lines = f.readlines()
+        for data in lines:
+            if "#" in data:
+                if "contig=<ID=" in data:
+                    chr_list.add(re.split("=|,", data)[2])
+            else:
+                if "SVTYPE=DEL" in data:
+                    delete.append(data)
+                elif "SVTYPE=INS" in data:
+                    insert.append(data)
+
+    print("\n> Save chromosome list and set...")
+    list_save(filename + "_ins", insert)
+    list_save(filename + "_del", delete)
+    set_save(filename + "_chr", chr_list)
+
+    print("\n> Process INS and DEL files...")
+    # Process INS
+    insert_result_data = pd.read_csv(filename + "_ins", sep="\t")
+    insert_result_data.insert(2, 'SPOS', 0)
+    insert_result_data.insert(3, 'EPOS', 0)
+    insert_result_data.insert(4, 'SVLEN', 0)
+
+    for index, row in insert_result_data.iterrows():
+        print(f" =>INS index = {index}", end='\r')
+        info_field = row["INFO"]
+
+        # CIPOS => SPOS, EPOS
+        pos = info_field.find("CIPOS")
+        if pos != -1:
+            pos += 6  # "CIPOS="
+            s = info_field[pos:].split(";")[0].split(",")
+            start_ = int(s[0])
+            end_ = int(s[1])
+            insert_result_data.loc[index, ["SPOS"]] = start_
+            insert_result_data.loc[index, ["EPOS"]] = end_
+        else:
+            insert_result_data.loc[index, ["SPOS"]] = 0
+            insert_result_data.loc[index, ["EPOS"]] = 0
+
+        # SVLEN or END => compute length
+        pos = info_field.find("SVLEN")
+        if pos == -1:
+            # If there's no SVLEN, attempt from END
+            pos_end = info_field.find("END") + 4  # "END="
+            s_len = info_field[pos_end:].split(";")[0]
+            length_val = int(s_len) - row["POS"]
+            insert_result_data.loc[index, ["SVLEN"]] = length_val
+        else:
+            # Found "SVLEN"
+            pos += 6  # "SVLEN="
+            s_len = info_field[pos:].split(";")[0]
+            length_val = int(s_len)
+            insert_result_data.loc[index, ["SVLEN"]] = length_val
+
+    insert_result_data.to_csv(os.path.join(data_dir, "insert_result_data.csv.vcf"), sep="\t")
+    print(f" =>INS finished, total number = {index}")
+
+    # Process DEL
+    delete_result_data = pd.read_csv(filename + "_del", sep="\t")
+    delete_result_data.insert(2, 'SPOS', 0)
+    delete_result_data.insert(3, 'EPOS', 0)
+    delete_result_data.insert(4, 'END', 0)
+    delete_result_data.insert(5, 'SEND', 0)
+    delete_result_data.insert(6, 'EEND', 0)
+
+    for index, row in delete_result_data.iterrows():
+        print(f" =>DEL index = {index}", end='\r')
+        info_field = row["INFO"]
+
+        # CIPOS => SPOS, EPOS
+        pos = info_field.find("CIPOS")
+        if pos != -1:
+            pos += 6  # "CIPOS="
+            s = info_field[pos:].split(";")[0].split(",")
+            start_ = int(s[0])
+            end_ = int(s[1])
+            delete_result_data.loc[index, ["SPOS"]] = start_
+            delete_result_data.loc[index, ["EPOS"]] = end_
+        else:
+            delete_result_data.loc[index, ["SPOS"]] = 0
+            delete_result_data.loc[index, ["EPOS"]] = 0
+
+        # END or SVLEN => final END value
+        pos_end = info_field.find("END")
+        if pos_end != -1:
+            pos_end += 4  # "END="
+            s_end = info_field[pos_end:].split(";")[0]
+            try:
+                end_value = int(s_end)
+            except ValueError:
+                print(f"[ERROR] Parsing END value: {s_end}")
+                end_value = None
+        else:
+            pos_svlen = info_field.find("SVLEN")
+            if pos_svlen != -1:
+                pos_svlen += 6  # "SVLEN="
+                s_svlen = info_field[pos_svlen:].split(";")[0]
+                try:
+                    svlen_value = abs(int(s_svlen))
+                    end_value = row["POS"] + svlen_value
+                except ValueError:
+                    print(f"[ERROR] Parsing SVLEN value: {s_svlen}")
+                    end_value = None
+            else:
+                print(f"[WARN] Neither END nor SVLEN found in INFO: {info_field}")
+                end_value = None
+
+        if end_value is not None:
+            delete_result_data.loc[index, ["END"]] = end_value
+        else:
+            print(f"[WARN] Unable to set END for index {index}")
+
+        # CIEND => SEND, EEND
+        pos_ciend = info_field.find("CIEND")
+        if pos_ciend != -1:
+            pos_ciend += 6  # "CIEND="
+            s = info_field[pos_ciend:].split(";")[0].split(",")
+            start_ = int(s[0])
+            end_ = int(s[1])
+            delete_result_data.loc[index, ["SEND"]] = start_
+            delete_result_data.loc[index, ["EEND"]] = end_
+
+    delete_result_data.to_csv(os.path.join(data_dir, "delete_result_data.csv.vcf"), sep="\t")
+    print(f" =>DEL finished, total number = {index}")
+
+    end_time = time.time()
+    vcf_preprocess_time = end_time - start_time
+    print(f"\n[INFO] VCF preprocess time: {vcf_preprocess_time:.2f} seconds")
+
+
+# ----------------- RD Preprocess Logic ---------------- #
+def get_cpus_for_socket(target_socket_id):
+    """Return a list of CPU core IDs for the specified socket."""
+    cpus_for_socket = []
+    cpu_dir = "/sys/devices/system/cpu/"
+    for cpu in os.listdir(cpu_dir):
+        if cpu.startswith("cpu") and cpu[3:].isdigit():
+            cpu_id = int(cpu[3:])
+            topo_path = os.path.join(cpu_dir, cpu, "topology", "physical_package_id")
+            if os.path.exists(topo_path):
+                with open(topo_path, 'r') as f:
+                    socket_id = int(f.read().strip())
+                if socket_id == target_socket_id:
+                    cpus_for_socket.append(cpu_id)
+    return cpus_for_socket
+
+def get_chromosome_list(bam_file):
+    cmd = f"samtools idxstats {bam_file}"
+    result = subprocess.run(cmd, shell=True,
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE,
+                           universal_newlines=True)
+    chromosomes = []
+    for line in result.stdout.strip().split('\n'):
+        fields = line.split('\t')
+        # Exclude '*' and chromosomes with zero length
+        if len(fields) >= 1 and fields[0] != '*' and int(fields[2]) > 0:
+            chromosomes.append(fields[0])
+    return chromosomes
+
+def process_chromosome(chrom, depth_dir, bam_file_path, cpus_for_socket):
+    """Process the read depth for a single chromosome (must be top-level for multiprocessing)."""
+    try:
+        # Attempt to set CPU affinity for this subprocess
+        try:
+            os.sched_setaffinity(0, cpus_for_socket)
+        except AttributeError:
+            pass
+        except Exception as e:
+            print(f" => Subprocess set CPU affinity failed: {e}")
+
+        output_file = os.path.join(depth_dir, chrom)
+        if os.path.exists(output_file):
+            print(f"= > File {chrom} exists, skipping.")
+            return
+
+        print(f" => Processing chromosome {chrom}...")
+        cmd = f"samtools depth -r {chrom} -@ 1 {bam_file_path} > {output_file}"
+        subprocess.call(cmd, shell=True)
+        print(f" => Finished chromosome {chrom}")
+
+    except Exception as e:
+        print(f"> Error processing chromosome {chrom}: {e}")
+
+def rd_preprocess(args):
+    """
+    Encapsulates the entire Read Depth (RD) preprocessing logic.
+
+    Args:
+        args.data_dir (str): Path to the data directory.
+        args.bam_dir (str): Path to the BAM file.
+        args.thread_num (int): Number of threads to use.
+    """
+    data_dir = args.data_dir
+    bam_dir = args.bam_dir
+    num_processes = args.thread_num
+
+    current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    print("<=============== F-SV: Read Depth Preprocess ===============>")
+    print(f"[INFO] F-SV preprocess Read Depth begin time: {current_time}")
+
+    start_time = time.time()
+
+    depth_dir = os.path.join(data_dir, "depth/")
+    mymkdir(depth_dir)
+
+    # 1. Set CPU affinity
+    target_socket_id = 0  # adapt as needed
+    cpus_for_socket = get_cpus_for_socket(target_socket_id)
+    total_threads = num_processes
+
+    if len(cpus_for_socket) < total_threads:
+        print(f"> warning: Socket {target_socket_id} CPU number less than total thread number.")
+        total_threads = len(cpus_for_socket)
+
+    # Attempt to set CPU affinity for the main process
+    try:
+        os.sched_setaffinity(0, cpus_for_socket)
+        print(f"\n> set CPU affinity to Cores: {cpus_for_socket}")
+    except AttributeError:
+        print("> os.sched_setaffinity is not supported on this system.")
+    except Exception as e:
+        print(f"> set CPU affinity failed: {e}")
+
+    # 2. Parallel process each chromosome
+    chromosomes = get_chromosome_list(bam_dir)
+
+    print(f"\n> Parallel process... ")
+    pool_size = min(len(chromosomes), total_threads)
+    print(f"[INFO] Using a pool size of {pool_size} with total threads: {len(cpus_for_socket)}")
+
+    with multiprocessing.Pool(processes=pool_size) as pool:
+        results = [
+            pool.apply_async(process_chromosome, (chrom, depth_dir, bam_dir, cpus_for_socket))
+            for chrom in chromosomes
+        ]
+        pool.close()
+        pool.join()
+
+        for r in results:
+            try:
+                r.get()
+            except Exception as e:
+                print(f" => Exception occurred during processing: {e}")
+
+    end_time = time.time()
+    rd_preprocess_time = end_time - start_time
+    print(f"\n[INFO] Read Depth preprocess time: {rd_preprocess_time:.2f} seconds")
+
+# ----------------- Main Function with Subcommands ---------------- #
+def main():
+    parser = argparse.ArgumentParser(description="MMF-SV preprocess toolkit")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Subcommand: vcf
+    vcf_parser = subparsers.add_parser("vcf", help="Preprocess VCF files")
+    vcf_parser.add_argument('-D', '--data_dir', required=True, help="Data directory")
+    vcf_parser.add_argument('-vcf', '--vcf_dir', required=True, help="VCF file path")
+
+    # Subcommand: rd
+    rd_parser = subparsers.add_parser("rd", help="Preprocess Read Depth files")
+    rd_parser.add_argument('-D', '--data_dir', required=True, help="Data directory")
+    rd_parser.add_argument('-i', '--bam_dir', required=True, help="BAM file path")
+    rd_parser.add_argument('-t', '--thread_num', type=int, default=4, help="Number of threads")
+
+    args = parser.parse_args()
+
+    if args.command == "vcf":
+        vcf_preprocess(args)
+    elif args.command == "rd":
+        rd_preprocess(args)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()

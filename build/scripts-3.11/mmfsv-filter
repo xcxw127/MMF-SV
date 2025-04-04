@@ -1,0 +1,297 @@
+#!/home/xzy/usr/anaconda3/envs/MMF-SV-py3.11/bin/python
+# -*- coding: utf-8 -*- 
+
+import argparse
+import os
+import random
+import time
+from multiprocessing import Pool, cpu_count
+
+import numpy as np
+import pandas as pd
+import pysam
+import pytorch_lightning as pl
+import ray
+import torch
+import torch.nn as nn
+import torchvision
+from hyperopt import hp
+from pudb import set_trace
+from pytorch_lightning import seed_everything
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from ray import tune
+from ray.tune import CLIReporter
+from ray.tune.integration.pytorch_lightning import (
+    TuneReportCallback, TuneReportCheckpointCallback)
+from ray.tune.schedulers import ASHAScheduler, PopulationBasedTraining
+from ray.tune.search import Repeater
+from ray.tune.search.hyperopt import HyperOptSearch
+import pandas as pd
+import re
+from mmfsv import list2img
+from mmfsv import utilities as ut
+from mmfsv.net import IDENet
+import psutil
+import sys
+
+
+# Set environment, limit thread number
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
+
+
+my_label = "7+11channel_predict_5fold"
+
+
+# Print system start time
+current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+print(f"\n[INFO] MMF-SV begin time: {current_time}")
+
+
+# Load arguments
+parser = argparse.ArgumentParser(description="MMF-SV filter")
+parser.add_argument('-D', '--data_dir', type=str, required=True, help="Path to the data directory")
+parser.add_argument('-i', '--bam_dir', type=str, required=True, help="Path to the BAM directory")
+parser.add_argument('-M', '--model_dir', type=str, required=True, help="Path to the checkpoint file (.ckpt)")
+parser.add_argument('-vcf', '--input_vcf_dir', type=str, required=True, help="Path to the input VCF directory")
+parser.add_argument('-t', '--thread_num', type=int, default=4, help="Number of threads to use (default: 4)")
+parser.add_argument('-bs', '--batch_size', type=int, default=16, help="Batch size for testing (default: 16)")
+parser.add_argument('-GPU', '--GPU_index', type=str, default="0", help="GPU index used for testing (default: 0)")
+
+args = parser.parse_args()
+
+# Get arguments
+data_dir = args.data_dir
+bam_dir = args.bam_dir
+model_dir = args.model_dir
+input_vcf_dir = args.input_vcf_dir
+num_processes = args.thread_num
+bs = args.batch_size
+num_cuda = args.GPU_index
+
+print("\n>>> Arguments Configuration")
+print(f"Data directory: {data_dir}")
+print(f"BAM directory: {bam_dir}")
+print(f"Model checkpoint: {model_dir}")
+print(f"Input VCF directory: {input_vcf_dir}")
+print(f"Thread number: {num_processes}")
+print(f"Batch size: {bs}")
+print(f"GPU index: {num_cuda}")
+print()
+
+# Choose GPU index
+os.environ["CUDA_VISIBLE_DEVICES"] = num_cuda
+
+# Print Server configuration
+print(">>> Server Configuration")
+# Get CPU information
+cpu_info = psutil.cpu_count(logical=False)  # get physical core number
+logical_cores = psutil.cpu_count(logical=True)  # get logical core number
+# Get CPU topological information
+cpu_topology = os.popen('lscpu').read()
+# Get CPU socket number
+num_sockets = int(os.popen("lscpu | grep 'Socket(s)' | awk '{print $2}'").read().strip())
+# Count physical cores and threads
+num_cores_per_socket = cpu_info // num_sockets
+threads_per_socket = logical_cores // num_sockets
+# Print CPU configuration
+print(f"Server has {num_sockets} socket(s).")
+print(f"Each socket has {num_cores_per_socket} physical core(s).")
+print(f"Each socket has {threads_per_socket} thread(s).")
+print()
+
+
+seed_everything(2024) 
+
+
+all_enforcement_refresh = 0
+position_enforcement_refresh = 0
+img_enforcement_refresh = 0
+sign_enforcement_refresh = 0 # attention
+cigar_enforcement_refresh = 0
+
+
+sam_file = pysam.AlignmentFile(bam_dir, "rb")
+chr_list = sam_file.references
+chr_length = sam_file.lengths
+sam_file.close()
+
+
+hight = 224
+
+
+# 判断当前的染色体名称是否包含"chr"
+if any("chr" in chr_name.lower() for chr_name in chr_list):
+    valid_chroms = {"chr" + str(i) for i in range(1, 23)}
+    valid_chroms |= {"chrX", "chrY"}
+else:
+    valid_chroms = {str(i) for i in range(1, 23)}
+    valid_chroms |= {"X", "Y"}
+
+# 过滤出合法的染色体及其对应的长度
+filtered = [(chr_name, length) for chr_name, length in zip(chr_list, chr_length) if chr_name in valid_chroms]
+if filtered:
+    chr_list, chr_length = zip(*filtered)
+else:
+    chr_list, chr_length = (), ()
+
+
+# Test: select chromosome
+# selected_chromosomes = ['22']
+# selected_chromosomes = ['chr1', 'chr2', 'chr3']
+# chr_list, chr_length = zip(*[(chr_name, length) for chr_name, length in zip(chr_list, chr_length) if chr_name in selected_chromosomes])
+
+
+print(f"[INFO] Number of chromosomes: {len(chr_list)}")
+print("[INFO] Chromosome Name and Lengths:")
+for chr_name, length in zip(chr_list, chr_length):
+    print(f"[INFO] Chromosome: {chr_name}, Length: {length}")
+print()
+
+
+print("<=============== MMF-SV: Image Generation ===============>")
+print(f"[INFO] Image generation begin time: {current_time}")
+
+for chromosome, chr_len in zip(chr_list, chr_length):
+    # chromosome_sign, mid_sign, mid_sign_img file
+    if os.path.exists(data_dir + "chromosome_sign/" + chromosome + ".pt") and not sign_enforcement_refresh:
+        print(" > chromosome_sign/" + chromosome + ".pt exist, loading ...")
+        chromosome_sign = torch.load(data_dir + "chromosome_sign/" + chromosome + ".pt", weights_only=True)
+        mid_sign = torch.load(data_dir + "chromosome_sign/" + chromosome + "_mids_sign.pt", weights_only=True)
+        mid_sign_img = torch.load(data_dir + "chromosome_img/" + chromosome + "_m(i)d_sign.pt", weights_only=True)
+    else:
+        print(" > chromosome_sign/" + chromosome + ".pt not exist, preprocess chromosome " + chromosome + "...")
+        ut.mymkdir(data_dir + "chromosome_sign/")
+
+        # Preprocess chromosome_sign, mid_sign, mid_sign_list
+        chromosome_sign, mid_sign, mid_sign_list = ut.preprocess(bam_dir, chromosome, chr_len, data_dir, num_processes) # parallel
+        
+        # Save chromosome_sign, mid_sign, mid_sign_list
+        print(" > save chromosome_sign, mid_sign, mid_sign_list to files...")
+        torch.save(chromosome_sign, data_dir + "chromosome_sign/" + chromosome + ".pt")
+        torch.save(mid_sign, data_dir + "chromosome_sign/" + chromosome + "_mids_sign.pt")
+        torch.save(mid_sign_list, data_dir + "chromosome_sign/" + chromosome + "_m(i)d_sign.pt")
+        
+        # Transform ins signal to images
+        print(" > transform ins signal to images...")
+        mid_sign_img = torch.tensor(list2img.deal_list(mid_sign_list))
+
+        # Save ins signal images to files
+        ut.mymkdir(data_dir + "chromosome_img/")
+        torch.save(mid_sign_img, data_dir + "chromosome_img/" + chromosome + "_m(i)d_sign.pt")
+        print()
+
+resize = torchvision.transforms.Resize([7, 11])
+
+print("\n<=============== MMF-SV: Filter ===============>")
+print(f"[INFO] Filter begin time: {current_time}")
+
+print(" > model loading...")
+config = {
+    "batch_size": 14,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "lr": 7.187267009530772e-06,
+    "weight_decay": 0.0011614665567890423,
+    "model_name": "ViT-B/32",
+    "KFold": 5,
+    "KFold_num": 0,
+}
+
+# Load model
+model = IDENet.load_from_checkpoint(
+    checkpoint_path=model_dir,
+    path=data_dir, 
+    config=config
+)
+model = model.eval().cuda()
+
+
+print(" > open vcf file to filter...")
+# open vcf file to filter
+filename = input_vcf_dir
+file = open(filename + "_filter.vcf", 'w')
+
+
+print("[* filter begin *]")
+with open(filename, "r") as f:
+    lines = f.readlines()
+    total_count = len(lines)
+    current_count = 0
+    for data in lines:
+        current_count += 1
+        sys.stdout.write(f"\r Filtered SV = {current_count}/{total_count}")
+        sys.stdout.flush()
+        # 写入头行（包含 "#" 的行）直接写入
+        if "#" in data:  # 头行，直接写入
+            file.writelines(data)
+        else:
+            try:
+                if "DEL" in data:
+                    data_list = data.split("\t")
+                    pos_begin = int(data_list[1])
+                    s = data_list[7]
+                    if "END" in s:
+                        pos = s.find("END") + 4  # "END="
+                        s = s[pos:]
+                        s = s.split(";")[0]
+                        s = int(s)
+                    else:
+                        pos = s.find("SVLEN") + 6
+                        s = s[pos:]
+                        s = s.split(";")[0]
+                        s = pos_begin + int(s)
+                    end = s
+                    gap = int((end - pos_begin) / 4)
+                    if gap == 0:
+                        gap = 1
+                    begin = pos_begin - 1 - gap
+                    end = end - 1 + gap
+                elif "INS" in data:
+                    data_list = data.split("\t")
+                    pos_begin = int(data_list[1])
+                    gap = 112
+                    begin = pos_begin - 1 - gap
+                    end = pos_begin - 1 + gap
+                else:
+                    # 如果数据行既不包含 "DEL" 也不包含 "INS"，直接跳过这条数据
+                    continue
+
+                # 边界检查
+                if begin < 0:
+                    begin = 0
+                if end >= chr_len:
+                    end = chr_len - 1
+
+                # 将特征信号转换为图像
+                ins_img = ut.to_input_image_single(chromosome_sign[:, begin:end])  # SR_left/right, RD
+                ins_img_mid = ut.to_input_image_single(mid_sign[:, begin:end])       # CIGAR M/I/D/S
+                img_i = resize(mid_sign_img[begin:end].unsqueeze(0))
+                ins_img_i = img_i.reshape(1, -1)
+                all_ins_img = torch.cat([ins_img, ins_img_mid], 0)
+
+                # 使用模型进行预测
+                y_hat = model(all_ins_img.unsqueeze(dim=0).cuda(), ins_img_i.cuda())
+                type = torch.argmax(y_hat, dim=1)
+
+                # 根据预测结果更新数据内容后写入文件
+                if type == 0:
+                    file.writelines(data)
+                elif type == 1:
+                    file.writelines(data.replace('INS', 'DEL'))
+                elif type == 2:
+                    file.writelines(data.replace('DEL', 'INS'))
+
+            except RuntimeError as e:
+                # 当发生异常时，将原始数据写入文件，并打印警告提示
+                # print(f"\nWarning: encountered error at line {current_count}, writing original record. Error: {e}")
+                file.writelines(data)
+
+
+print("\n[* filter end *]")
+file.close()

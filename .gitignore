@@ -1,0 +1,14 @@
+.DS_Store
+src/sniffles.egg-info
+dist
+__pycache__
+*.pyc
+.rsync-ignore
+.idea/
+.idea/*
+venv/
+venv/*
+deploybcm.sh
+resultadoRsync.txt
+.github/
+.github/*
