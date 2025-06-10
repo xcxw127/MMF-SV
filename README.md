@@ -1,3 +1,3 @@
 # MMF-SV
-An Integrated Multi-Modal Fusion Framework for Structural Variant Detection
+A Multi-Modal Feature Fusion-Based Structural Variant Caller
 
